@@ -12,6 +12,9 @@ pub enum AppError {
     #[error("Server Not Supported From Range Bytes")]
     RangeNotSupported,
 
+    #[error("Unspecified file size or is zero")]
+    InvalidFileSize,
+
     #[error("Network Card Target Not Found ({0})")]
     NetcardNotFound(String),
 

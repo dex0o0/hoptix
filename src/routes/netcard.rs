@@ -25,9 +25,9 @@ pub fn get_available_interface() -> Result<Vec<NetworkInterface>> {
     Ok(valid_iterface)
 }
 
-pub async fn check_interface_connectivity(ip: IpAddr, url: &str) -> bool {
+pub async fn check_interface_connectivity(iface_name: &str, url: &str) -> bool {
     let client = match Client::builder()
-        .local_address(ip)
+        .interface(iface_name)
         .timeout(Duration::from_secs(3))
         .build()
     {
@@ -50,7 +50,7 @@ pub async fn get_working_interface(target_url: &str) -> Result<Vec<NetworkInterf
         let url = target_url.to_string();
 
         join_set.spawn(async move {
-            let is_ok = check_interface_connectivity(iface.ip, &url).await;
+            let is_ok = check_interface_connectivity(&iface.name, &url).await;
             (iface, is_ok)
         });
 

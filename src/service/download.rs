@@ -1,10 +1,13 @@
 use crate::error::{AppError, Result};
+use crate::models::message::Response;
 use crate::models::request::{check_range_support, Chunck, FileInfo};
 use crate::routes::netcard::NetworkInterface;
 use futures::StreamExt;
 use reqwest::Client;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::VecDeque, net::IpAddr, path::Path, sync::Arc, time::Duration};
 use tokio::io::BufWriter;
+use tokio::sync::mpsc;
 use tokio::{
     fs::OpenOptions,
     io::{AsyncSeekExt, AsyncWriteExt, SeekFrom},
@@ -105,24 +108,59 @@ pub async fn download_chunck(
     Ok(())
 }
 
-const CONC_PER_IFACE: usize = 16;
-
 pub async fn download_file_parallel(
     url: &str,
     file_size: u64,
     interface: Vec<NetworkInterface>,
     output_path: &Path,
+    progress_tx: mpsc::Sender<Response>,
+    downloaded: Arc<AtomicU64>,
+    num_chunck: usize,
+    num_threads: usize,
 ) -> Result<()> {
-    let chuncks = create_chunck(file_size, 16);
+    eprintln!("download_file_parallel started");
+    let chuncks = create_chunck(file_size, num_chunck);
     let chunck_queue = Arc::new(Mutex::new(VecDeque::from(chuncks)));
+
+    let total = file_size;
+    let progress_tx_clone = progress_tx.clone();
+    let downloaded_clone = downloaded.clone();
+    tokio::spawn(async move {
+        let mut last_downloaded = 0u64;
+        let mut last_time = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let current = downloaded_clone.load(Ordering::SeqCst);
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(last_time).as_secs_f64();
+            let speed = if elapsed > 0.0 {
+                (current - last_downloaded) as f64 / elapsed
+            } else {
+                0.0
+            };
+            let _ = progress_tx_clone
+                .send(Response::Progress {
+                    total,
+                    downloaded: current,
+                    speed,
+                })
+                .await;
+            last_downloaded = current;
+            last_time = now;
+            if current >= total {
+                break;
+            }
+        }
+    });
 
     let mut joinset = JoinSet::new();
     for iface in interface {
-        for thread_id in 0..CONC_PER_IFACE {
+        for thread_id in 0..num_threads {
             let queue = Arc::clone(&chunck_queue);
             let url = url.to_string();
             let path = output_path.to_path_buf();
             let iface = iface.clone();
+            let download_clone = downloaded.clone();
             joinset.spawn(async move {
                 let client = match Client::builder()
                     .interface(&iface.name)
@@ -162,8 +200,14 @@ pub async fn download_file_parallel(
                         iface.name, chunck.id, chunck.start, chunck.end
                     );
 
-                    if let Err(e) =
-                        download_chunck_with_client(&client, &url, chunck.clone(), &path).await
+                    if let Err(e) = download_chunck_with_client(
+                        &client,
+                        &url,
+                        chunck.clone(),
+                        &path,
+                        download_clone.clone(),
+                    )
+                    .await
                     {
                         faile_count += 1;
                         eprintln!(
@@ -188,6 +232,10 @@ pub async fn download_file_parallel(
         res.map_err(|e| AppError::IpcError(e.to_string()))?;
     }
 
+    downloaded.store(file_size, Ordering::SeqCst);
+
+    let _ = progress_tx.send(Response::Finished).await;
+
     Ok(())
 }
 
@@ -196,6 +244,7 @@ pub async fn download_chunck_with_client(
     url: &str,
     chunck: Chunck,
     file_path: &Path,
+    downloaded: Arc<AtomicU64>,
 ) -> Result<()> {
     let range_header = format!("bytes={}-{}", chunck.start, chunck.end);
     let response = client.get(url).header("Range", range_header).send().await?;
@@ -220,6 +269,9 @@ pub async fn download_chunck_with_client(
     while let Some(item) = stream.next().await {
         let data = item?;
         writer.write_all(&data).await.map_err(AppError::Io)?;
+
+        let data_len = data.len() as u64;
+        downloaded.fetch_add(data_len, Ordering::SeqCst);
     }
 
     writer.flush().await.map_err(AppError::Io)?;

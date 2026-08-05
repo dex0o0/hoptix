@@ -3,7 +3,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AppError {
-    #[error("Error File System / Inpute-Output: {0}")]
+    #[error("Error File System / Input-Output: {0}")]
     Io(#[from] io::Error),
 
     #[error("Network Error With HTTP: {0}")]
@@ -23,6 +23,12 @@ pub enum AppError {
 
     #[error("Error Connected To Socket:{0}")]
     IpcError(String),
+
+    #[error("failed to create config {0}")]
+    TomlSer(#[from] toml::ser::Error),
+
+    #[error("failed to read config {0}")]
+    Tomlde(#[from] toml::de::Error),
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;

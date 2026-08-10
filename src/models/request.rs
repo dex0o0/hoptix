@@ -1,10 +1,10 @@
-use std::net::IpAddr;
-
 use crate::error::{AppError, Result};
 use reqwest::{self, Client};
+use std::net::IpAddr;
+use url::Url;
 
 #[derive(Debug, Clone)]
-pub struct Chunck {
+pub struct Chunk {
     pub id: usize,
     pub start: u64,
     pub end: u64,
@@ -40,4 +40,13 @@ pub async fn check_range_support(url: &str) -> Result<u64> {
         .unwrap_or(0);
 
     Ok(content_length)
+}
+
+pub fn is_localhost(url: &str) -> bool {
+    if let Ok(parsed) = Url::parse(url)
+        && let Some(host) = parsed.host_str()
+    {
+        return host == "localhost" || host == "127.0.0.1";
+    }
+    false
 }

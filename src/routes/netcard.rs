@@ -8,7 +8,6 @@ use tokio::task::JoinSet;
 #[derive(Debug, Clone)]
 pub struct NetworkInterface {
     pub name: String,
-    pub ip: IpAddr,
 }
 
 pub fn get_available_interface() -> Result<Vec<NetworkInterface>> {
@@ -17,10 +16,7 @@ pub fn get_available_interface() -> Result<Vec<NetworkInterface>> {
     let valid_iterface = interfaces
         .into_iter()
         .filter(|iface| !iface.is_loopback())
-        .map(|iface| NetworkInterface {
-            name: iface.name,
-            ip: iface.addr.ip(),
-        })
+        .map(|iface| NetworkInterface { name: iface.name })
         .collect();
     Ok(valid_iterface)
 }

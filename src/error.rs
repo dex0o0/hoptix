@@ -29,6 +29,9 @@ pub enum AppError {
 
     #[error("failed to read config {0}")]
     Tomlde(#[from] toml::de::Error),
+
+    #[error("channel is close")]
+    ChannelClose,
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;

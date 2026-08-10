@@ -1,10 +1,10 @@
 use clap::Parser;
+use hoptix::SockConnect;
 use hoptix::config::get_config_path;
 use hoptix::models::message::{Command, Response};
-use hoptix::SockConnect;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::net::UnixStream;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 #[derive(Parser)]
 #[command(name = "hoptix")]

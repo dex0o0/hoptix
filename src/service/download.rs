@@ -1,12 +1,12 @@
 use crate::error::{AppError, Result};
-use crate::models::message::Response;
-use crate::models::request::{check_range_support, Chunck, FileInfo};
+use crate::event::event::DownloadEvent;
+use crate::models::request::{Chunk, FileInfo, check_range_support};
 use crate::routes::netcard::NetworkInterface;
 use futures::StreamExt;
 use reqwest::Client;
+use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::VecDeque, net::IpAddr, path::Path, sync::Arc, time::Duration};
-use tokio::io::BufWriter;
 use tokio::sync::mpsc;
 use tokio::{
     fs::OpenOptions,
@@ -14,6 +14,15 @@ use tokio::{
     sync::Mutex,
     task::JoinSet,
 };
+
+#[derive(Debug, Clone)]
+pub struct DownloadStatus {
+    pub id: u64,
+    pub total: u64,
+    pub downloaded: u64,
+    pub progress: f64,
+    pub elapsed: Duration,
+}
 
 pub async fn inspect_url(url: &str) -> Result<FileInfo> {
     let client = Client::new();
@@ -37,30 +46,30 @@ pub async fn inspect_url(url: &str) -> Result<FileInfo> {
     })
 }
 
-pub fn create_chunck(file_size: u64, num_chunck: usize) -> Vec<Chunck> {
-    const MIN_CHUNCK_SIZE: u64 = 2 * 1024 * 1024;
+pub fn create_chunk(file_size: u64, num_chunk: usize) -> Vec<Chunk> {
+    const MIN_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
 
-    let optimal = (file_size / MIN_CHUNCK_SIZE) as usize;
-    let num_chunck = optimal.clamp(1, num_chunck);
+    let optimal = (file_size / MIN_CHUNK_SIZE) as usize;
+    let num_chunk = optimal.clamp(1, num_chunk);
 
-    let mut chuncks = Vec::new();
+    let mut chunks = Vec::new();
 
-    if num_chunck == 0 || file_size == 0 {
-        return chuncks;
+    if num_chunk == 0 || file_size == 0 {
+        return chunks;
     }
-    let num_chunck_u64 = num_chunck as u64;
-    let base_chunck_size = file_size / num_chunck_u64;
+    let num_chunk_u64 = num_chunk as u64;
+    let base_chunk_size = file_size / num_chunk_u64;
 
-    for i in 0..num_chunck {
-        let start = (i as u64) * base_chunck_size;
+    for i in 0..num_chunk {
+        let start = (i as u64) * base_chunk_size;
 
-        let end = if i == num_chunck - 1 {
+        let end = if i == num_chunk - 1 {
             file_size - 1
         } else {
-            ((i as u64) + 1) * base_chunck_size - 1
+            ((i as u64) + 1) * base_chunk_size - 1
         };
 
-        chuncks.push(Chunck {
+        chunks.push(Chunk {
             id: i,
             start,
             end,
@@ -68,12 +77,12 @@ pub fn create_chunck(file_size: u64, num_chunck: usize) -> Vec<Chunck> {
             assigned_ip: None,
         });
     }
-    chuncks
+    chunks
 }
 
-pub async fn download_chunck(
+pub async fn download_chunk(
     url: &str,
-    chunck: Chunck,
+    chunk: Chunk,
     bound_ip: IpAddr,
     file_path: &Path,
 ) -> Result<()> {
@@ -84,7 +93,7 @@ pub async fn download_chunck(
         .pool_max_idle_per_host(10)
         .build()?;
 
-    let range_header = format!("bytes={}-{}", chunck.start, chunck.end);
+    let range_header = format!("bytes={}-{}", chunk.start, chunk.end);
     let mut response = client.get(url).header("Range", range_header).send().await?;
 
     if !response.status().is_success() {
@@ -97,30 +106,31 @@ pub async fn download_chunck(
         .await
         .map_err(AppError::Io)?;
 
-    file.seek(SeekFrom::Start(chunck.start))
+    file.seek(SeekFrom::Start(chunk.start))
         .await
         .map_err(AppError::Io)?;
 
-    while let Some(data_chunck) = response.chunk().await? {
-        file.write_all(&data_chunck).await.map_err(AppError::Io)?;
+    while let Some(data_chunk) = response.chunk().await? {
+        file.write_all(&data_chunk).await.map_err(AppError::Io)?;
     }
 
     Ok(())
 }
 
 pub async fn download_file_parallel(
+    id: u64,
     url: &str,
     file_size: u64,
     interface: Vec<NetworkInterface>,
     output_path: &Path,
-    progress_tx: mpsc::Sender<Response>,
+    progress_tx: mpsc::Sender<DownloadEvent>,
     downloaded: Arc<AtomicU64>,
-    num_chunck: usize,
+    num_chunk: usize,
     num_threads: usize,
 ) -> Result<()> {
     eprintln!("download_file_parallel started");
-    let chuncks = create_chunck(file_size, num_chunck);
-    let chunck_queue = Arc::new(Mutex::new(VecDeque::from(chuncks)));
+    let chunks = create_chunk(file_size, num_chunk);
+    let chunk_queue = Arc::new(Mutex::new(VecDeque::from(chunks)));
 
     let total = file_size;
     let progress_tx_clone = progress_tx.clone();
@@ -139,10 +149,10 @@ pub async fn download_file_parallel(
                 0.0
             };
             let _ = progress_tx_clone
-                .send(Response::Progress {
-                    total,
+                .send(DownloadEvent::Progress {
+                    id,
                     downloaded: current,
-                    speed,
+                    total,
                 })
                 .await;
             last_downloaded = current;
@@ -154,27 +164,53 @@ pub async fn download_file_parallel(
     });
 
     let mut joinset = JoinSet::new();
-    for iface in interface {
-        for thread_id in 0..num_threads {
-            let queue = Arc::clone(&chunck_queue);
+
+    let interfaces = if interface.is_empty() {
+        vec![NetworkInterface {
+            name: "default".to_string(),
+        }]
+    } else {
+        interface
+    };
+
+    for iface in interfaces {
+        for _thread_id in 0..num_threads {
+            let queue = Arc::clone(&chunk_queue);
             let url = url.to_string();
             let path = output_path.to_path_buf();
             let iface = iface.clone();
             let download_clone = downloaded.clone();
             joinset.spawn(async move {
-                let client = match Client::builder()
-                    .interface(&iface.name)
+                // let client = match Client::builder()
+                //     .interface(&iface.name)
+                //     .connect_timeout(Duration::from_secs(5))
+                //     .read_timeout(Duration::from_secs(15))
+                //     .pool_max_idle_per_host(10)
+                //     .build()
+                // {
+                //     Ok(c) => c,
+                //     Err(e) => {
+                //         eprintln!(
+                //             "can not create client for [{}] (message::Error::{e})",
+                //             iface.name
+                //         );
+                //         return;
+                //     }
+                // };
+
+                let builder = Client::builder()
                     .connect_timeout(Duration::from_secs(5))
                     .read_timeout(Duration::from_secs(15))
-                    .pool_max_idle_per_host(10)
-                    .build()
-                {
-                    Ok(c) => c,
+                    .pool_max_idle_per_host(10);
+
+                let client = match if iface.name == "default" {
+                    builder.build()
+                } else {
+                    builder.interface(&iface.name).build()
+                } {
+                    Ok(client) => client,
                     Err(e) => {
-                        eprintln!(
-                            "can not create client for [{}] (message::Error::{e})",
-                            iface.name
-                        );
+                        eprintln!("can not create client for [{}]:{}", iface.name, e);
                         return;
                     }
                 };
@@ -185,25 +221,25 @@ pub async fn download_file_parallel(
                     if faile_count >= MX_FAILS {
                         break;
                     }
-                    let maybe_chunck = {
+                    let maybe_chunk = {
                         let mut lock = queue.lock().await;
                         lock.pop_front()
                     };
 
-                    let chunck = match maybe_chunck {
+                    let chunk = match maybe_chunk {
                         Some(c) => c,
                         None => break,
                     };
 
                     println!(
                         "[{}] downloading {} (bytes={}-{})",
-                        iface.name, chunck.id, chunck.start, chunck.end
+                        iface.name, chunk.id, chunk.start, chunk.end
                     );
 
-                    if let Err(e) = download_chunck_with_client(
+                    if let Err(e) = download_chunk_with_client(
                         &client,
                         &url,
-                        chunck.clone(),
+                        chunk.clone(),
                         &path,
                         download_clone.clone(),
                     )
@@ -212,15 +248,15 @@ pub async fn download_file_parallel(
                         faile_count += 1;
                         eprintln!(
                             "Error on [{}] to download {}: (error message:{:?})",
-                            iface.name, chunck.id, e
+                            iface.name, chunk.id, e
                         );
                         let mut lock = queue.lock().await;
-                        lock.push_back(chunck);
+                        lock.push_back(chunk);
                         drop(lock);
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     } else {
                         faile_count = 0;
-                        println!("chonck:{} downloading with [{}]", chunck.id, iface.name);
+                        println!("chonck:{} downloading with [{}]", chunk.id, iface.name);
                     }
                     println!();
                 }
@@ -234,47 +270,99 @@ pub async fn download_file_parallel(
 
     downloaded.store(file_size, Ordering::SeqCst);
 
-    let _ = progress_tx.send(Response::Finished).await;
-
     Ok(())
 }
 
-pub async fn download_chunck_with_client(
+pub async fn download_chunk_with_client(
     client: &Client,
     url: &str,
-    chunck: Chunck,
+    chunk: Chunk,
     file_path: &Path,
     downloaded: Arc<AtomicU64>,
 ) -> Result<()> {
-    let range_header = format!("bytes={}-{}", chunck.start, chunck.end);
+    let range_header = format!("bytes={}-{}", chunk.start, chunk.end);
     let response = client.get(url).header("Range", range_header).send().await?;
 
-    if !response.status().is_success() {
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
         return Err(AppError::RangeNotSupported);
     }
 
-    let mut file = OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .open(file_path)
-        .await
         .map_err(AppError::Io)?;
 
-    file.seek(SeekFrom::Start(chunck.start))
-        .await
-        .map_err(AppError::Io)?;
+    let mut offset = chunk.start;
 
-    let mut writer = BufWriter::with_capacity(128 * 1024, file);
     let mut stream = response.bytes_stream();
 
     while let Some(item) = stream.next().await {
         let data = item?;
-        writer.write_all(&data).await.map_err(AppError::Io)?;
 
-        let data_len = data.len() as u64;
-        downloaded.fetch_add(data_len, Ordering::SeqCst);
+        file.write_at(&data, offset).map_err(AppError::Io)?;
+
+        offset += data.len() as u64;
+        downloaded.fetch_add(data.len() as u64, Ordering::SeqCst);
     }
 
-    writer.flush().await.map_err(AppError::Io)?;
+    Ok(())
+}
 
+pub async fn download_single(
+    id: u64,
+    url: &str,
+    output_path: &Path,
+    downloaded: Arc<AtomicU64>,
+    progress_tx: mpsc::Sender<DownloadEvent>,
+    file_size: u64,
+) -> Result<()> {
+    println!("single download started");
+    let total = file_size;
+    let progress_tx_clone = progress_tx.clone();
+    let downloaded_clone = downloaded.clone();
+    tokio::spawn(async move {
+        // let mut last_downloaded = 0u64;
+        // let mut last_time = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let current = downloaded_clone.load(Ordering::SeqCst);
+            // let now = std::time::Instant::now();
+            // let elapsed = now.duration_since(last_time).as_secs_f64();
+            // let speed = if elapsed > 0.0 {
+            //     (current - last_downloaded) as f64 / elapsed
+            // } else {
+            //     0.0
+            // };
+
+            let _ = progress_tx_clone
+                .send(DownloadEvent::Progress {
+                    id,
+                    downloaded: current,
+                    total,
+                })
+                .await;
+            // last_downloaded = current;
+            // last_time = now;
+            if current >= total {
+                break;
+            }
+        }
+    });
+
+    let client = Client::new();
+    let mut response = client.get(url).send().await?;
+
+    println!("single response status: {}", response.status());
+
+    let mut file = tokio::fs::File::create(output_path).await?;
+    let mut total = 0u64;
+    while let Some(chunk) = response.chunk().await? {
+        file.write_all(&chunk).await?;
+        total += chunk.len() as u64;
+
+        downloaded.fetch_add(chunk.len() as u64, Ordering::SeqCst);
+        println!("downloaded {} bytes", total);
+    }
+    println!("single download finished: {} bytes", total);
     Ok(())
 }

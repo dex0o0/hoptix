@@ -20,7 +20,7 @@ enum Cli {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Cli::parse();
     let mut socket_path = get_config_path();
     socket_path.set_file_name("hoptix.sock");
@@ -81,7 +81,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn show_progress(stream: &mut UnixStream) -> Result<(), Box<dyn std::error::Error>> {
+async fn show_progress(
+    stream: &mut UnixStream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pb = ProgressBar::new(0);
     pb.set_style(
         ProgressStyle::default_bar()

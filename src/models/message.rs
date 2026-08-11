@@ -1,12 +1,14 @@
 use serde::{Deserialize, Serialize};
 
+use crate::service::download::DownloadStatus;
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Command {
     Start { url: String, output: Option<String> },
     Status,
     Pause,
     Resume,
-    Stop,
+    Stop { id: u64 },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -21,4 +23,10 @@ pub enum Response {
     },
     Finished,
     Error(String),
+    Cancelled {
+        id: u64,
+    },
+    Status {
+        downloads: Vec<DownloadStatus>,
+    },
 }

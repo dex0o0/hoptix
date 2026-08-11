@@ -2,8 +2,8 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering},
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -11,6 +11,7 @@ use tokio::{
     sync::mpsc::{self, Sender},
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::AppConf,
@@ -26,6 +27,7 @@ pub struct DownloadSession {
     pub downloaded: Arc<AtomicU64>,
     pub start_time: Instant,
     pub handle: Option<JoinHandle<()>>,
+    pub cancel_token: CancellationToken,
 }
 
 pub struct DownloadManager {
@@ -54,7 +56,9 @@ impl DownloadManager {
     ) -> Result<u64> {
         let id = self.next_id();
         let downloaded = Arc::new(AtomicU64::new(0));
-        let mut session = DownloadSession::new(id, size, downloaded.clone());
+        let cancel_token = CancellationToken::new();
+
+        let mut session = DownloadSession::new(id, size, downloaded.clone(), cancel_token.clone());
 
         let task = DownloadTask::new(
             id,
@@ -66,6 +70,7 @@ impl DownloadManager {
             interface,
             self.event_sender.clone(),
             config,
+            cancel_token,
         );
 
         let handle = task.start();
@@ -83,6 +88,7 @@ impl DownloadManager {
     pub fn get(&self, id: &u64) -> Option<&DownloadSession> {
         self.downloads.get(id)
     }
+
     pub fn next_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -105,16 +111,39 @@ impl DownloadManager {
     pub fn get_all(&self) -> impl Iterator<Item = &DownloadSession> {
         self.downloads.values()
     }
+
+    pub fn cancel(&self, id: u64) -> Result<()> {
+        let session = self
+            .downloads
+            .get(&id)
+            .ok_or_else(|| AppError::IpcError(format!("Download {} not found", id)))?;
+
+        session.cancel_token.cancel();
+
+        Ok(())
+    }
+    pub fn cleanup(&mut self) {
+        self.downloads.retain(|_, session| match &session.handle {
+            Some(handle) => !handle.is_finished(),
+            None => false,
+        });
+    }
 }
 
 impl DownloadSession {
-    pub fn new(id: u64, total: u64, downloaded: Arc<AtomicU64>) -> Self {
+    pub fn new(
+        id: u64,
+        total: u64,
+        downloaded: Arc<AtomicU64>,
+        cancel_token: CancellationToken,
+    ) -> Self {
         Self {
             id,
             total,
             downloaded,
             start_time: Instant::now(),
             handle: None,
+            cancel_token,
         }
     }
 

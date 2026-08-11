@@ -1,9 +1,10 @@
 use crate::error::{AppError, Result};
 use crate::event::event::DownloadEvent;
-use crate::models::request::{Chunk, FileInfo, check_range_support};
+use crate::models::request::{check_range_support, Chunk, FileInfo};
 use crate::routes::netcard::NetworkInterface;
 use futures::StreamExt;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::VecDeque, net::IpAddr, path::Path, sync::Arc, time::Duration};
@@ -14,8 +15,9 @@ use tokio::{
     sync::Mutex,
     task::JoinSet,
 };
+use tokio_util::sync::CancellationToken;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadStatus {
     pub id: u64,
     pub total: u64,
@@ -127,6 +129,7 @@ pub async fn download_file_parallel(
     downloaded: Arc<AtomicU64>,
     num_chunk: usize,
     num_threads: usize,
+    cancel_token: CancellationToken,
 ) -> Result<()> {
     eprintln!("download_file_parallel started");
     let chunks = create_chunk(file_size, num_chunk);
@@ -135,11 +138,14 @@ pub async fn download_file_parallel(
     let total = file_size;
     let progress_tx_clone = progress_tx.clone();
     let downloaded_clone = downloaded.clone();
+    let cancel = cancel_token.clone();
     tokio::spawn(async move {
         let mut last_downloaded = 0u64;
         let mut last_time = std::time::Instant::now();
         loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::select! {
+                _ = cancel.cancelled()=>{break;}
+                _ = tokio::time::sleep(Duration::from_millis(500)) =>{
             let current = downloaded_clone.load(Ordering::SeqCst);
             let now = std::time::Instant::now();
             let elapsed = now.duration_since(last_time).as_secs_f64();
@@ -160,6 +166,7 @@ pub async fn download_file_parallel(
             if current >= total {
                 break;
             }
+            }}
         }
     });
 
@@ -180,6 +187,7 @@ pub async fn download_file_parallel(
             let path = output_path.to_path_buf();
             let iface = iface.clone();
             let download_clone = downloaded.clone();
+            let cancel = cancel_token.clone();
             joinset.spawn(async move {
                 // let client = match Client::builder()
                 //     .interface(&iface.name)
@@ -218,6 +226,9 @@ pub async fn download_file_parallel(
                 let mut faile_count = 0;
                 const MX_FAILS: u32 = 3;
                 loop {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
                     if faile_count >= MX_FAILS {
                         break;
                     }
@@ -242,6 +253,7 @@ pub async fn download_file_parallel(
                         chunk.clone(),
                         &path,
                         download_clone.clone(),
+                        cancel.clone(),
                     )
                     .await
                     {
@@ -279,6 +291,7 @@ pub async fn download_chunk_with_client(
     chunk: Chunk,
     file_path: &Path,
     downloaded: Arc<AtomicU64>,
+    cancel_token: CancellationToken,
 ) -> Result<()> {
     let range_header = format!("bytes={}-{}", chunk.start, chunk.end);
     let response = client.get(url).header("Range", range_header).send().await?;
@@ -296,13 +309,27 @@ pub async fn download_chunk_with_client(
 
     let mut stream = response.bytes_stream();
 
-    while let Some(item) = stream.next().await {
-        let data = item?;
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled()=> {
+                return Ok(());
+            }
+            item = stream.next()=>{
+                let item = match item {
+                    Some(i)=>i?,
+                    None=>break,
+                };
+                let data = item;
 
-        file.write_at(&data, offset).map_err(AppError::Io)?;
+                file.write_at(&data, offset).map_err(AppError::Io)?;
 
-        offset += data.len() as u64;
-        downloaded.fetch_add(data.len() as u64, Ordering::SeqCst);
+                offset += data.len() as u64;
+
+                downloaded.fetch_add(data.len() as u64, Ordering::SeqCst);
+
+
+            }
+        }
     }
 
     Ok(())
@@ -315,36 +342,42 @@ pub async fn download_single(
     downloaded: Arc<AtomicU64>,
     progress_tx: mpsc::Sender<DownloadEvent>,
     file_size: u64,
+    cancel_token: CancellationToken,
 ) -> Result<()> {
     println!("single download started");
     let total = file_size;
     let progress_tx_clone = progress_tx.clone();
     let downloaded_clone = downloaded.clone();
+    let cancel = cancel_token.clone();
     tokio::spawn(async move {
         // let mut last_downloaded = 0u64;
         // let mut last_time = std::time::Instant::now();
         loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let current = downloaded_clone.load(Ordering::SeqCst);
-            // let now = std::time::Instant::now();
-            // let elapsed = now.duration_since(last_time).as_secs_f64();
-            // let speed = if elapsed > 0.0 {
-            //     (current - last_downloaded) as f64 / elapsed
-            // } else {
-            //     0.0
-            // };
+            tokio::select! {
+                _ = cancel.cancelled()=>{break;}
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                    let current = downloaded_clone.load(Ordering::SeqCst);
+                    // let now = std::time::Instant::now();
+                    // let elapsed = now.duration_since(last_time).as_secs_f64();
+                    // let speed = if elapsed > 0.0 {
+                    //     (current - last_downloaded) as f64 / elapsed
+                    // } else {
+                    //     0.0
+                    // };
 
-            let _ = progress_tx_clone
-                .send(DownloadEvent::Progress {
-                    id,
-                    downloaded: current,
-                    total,
-                })
-                .await;
-            // last_downloaded = current;
-            // last_time = now;
-            if current >= total {
-                break;
+                    let _ = progress_tx_clone
+                        .send(DownloadEvent::Progress {
+                            id,
+                            downloaded: current,
+                            total,
+                        })
+                        .await;
+                    // last_downloaded = current;
+                    // last_time = now;
+                    if current >= total {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -356,13 +389,33 @@ pub async fn download_single(
 
     let mut file = tokio::fs::File::create(output_path).await?;
     let mut total = 0u64;
-    while let Some(chunk) = response.chunk().await? {
-        file.write_all(&chunk).await?;
-        total += chunk.len() as u64;
 
-        downloaded.fetch_add(chunk.len() as u64, Ordering::SeqCst);
-        println!("downloaded {} bytes", total);
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                break;
+            }
+
+            chunk = response.chunk() => {
+                let chunk = match chunk? {
+                    Some(chunk) => chunk,
+                    None => break,
+                };
+
+                file.write_all(&chunk).await?;
+
+                total += chunk.len() as u64;
+
+                downloaded.fetch_add(
+                    chunk.len() as u64,
+                    Ordering::SeqCst,
+                );
+
+                println!("downloaded {} bytes", total);
+            }
+        }
     }
+
     println!("single download finished: {} bytes", total);
     Ok(())
 }

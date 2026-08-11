@@ -7,9 +7,10 @@ use crate::{
 };
 use std::{
     path::PathBuf,
-    sync::{Arc, atomic::AtomicU64},
+    sync::{atomic::AtomicU64, Arc},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 
 pub struct DownloadTask {
     pub id: u64,
@@ -21,6 +22,7 @@ pub struct DownloadTask {
     pub interface: Vec<NetworkInterface>,
     pub progress_tx: mpsc::Sender<DownloadEvent>,
     pub config: Arc<AppConf>,
+    pub cancel_token: CancellationToken,
 }
 
 impl DownloadTask {
@@ -34,6 +36,7 @@ impl DownloadTask {
         interface: Vec<NetworkInterface>,
         progress_tx: mpsc::Sender<DownloadEvent>,
         config: Arc<AppConf>,
+        cancel_token: CancellationToken,
     ) -> Self {
         Self {
             id,
@@ -45,6 +48,7 @@ impl DownloadTask {
             downloaded,
             progress_tx,
             config,
+            cancel_token,
         }
     }
     pub fn start(self) -> JoinHandle<()> {
@@ -53,7 +57,11 @@ impl DownloadTask {
 
             match self.run().await {
                 Ok(_) => {
-                    let _ = self.progress_tx.send(DownloadEvent::Finished { id }).await;
+                    if self.cancel_token.is_cancelled() {
+                        let _ = self.progress_tx.send(DownloadEvent::Cancelled { id }).await;
+                    } else {
+                        let _ = self.progress_tx.send(DownloadEvent::Finished { id }).await;
+                    }
                 }
                 Err(e) => {
                     let _ = self
@@ -77,6 +85,7 @@ impl DownloadTask {
                 self.downloaded.clone(),
                 self.progress_tx.clone(),
                 self.size,
+                self.cancel_token.clone(),
             )
             .await?;
             return Ok(());
@@ -93,6 +102,7 @@ impl DownloadTask {
             self.downloaded.clone(),
             self.config.chunk,
             self.config.thread,
+            self.cancel_token.clone(),
         )
         .await?;
 

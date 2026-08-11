@@ -1,5 +1,4 @@
 use crate::{
-    AppState, SockConnect,
     config::AppConf,
     error::{AppError, Result},
     models::{
@@ -8,14 +7,15 @@ use crate::{
     },
     routes::netcard,
     service::{
-        download::{DownloadStatus, inspect_url},
+        download::{inspect_url, DownloadStatus},
         download_task::DownloadTask,
         manager::DownloadSession,
     },
+    AppState, SockConnect,
 };
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, atomic::Ordering},
+    sync::{atomic::Ordering, Arc},
     time::Instant,
 };
 use tokio::{net::UnixStream, sync::Mutex};
@@ -38,7 +38,12 @@ impl CommandHandle {
                     .map_err(|e| AppError::IpcError(e.to_string()))?;
             }
             Command::Status => {
-                self.status().await;
+                let status = self.status().await;
+
+                let mut stream = self.stream.lock().await;
+                SockConnect::send_response(&mut stream, &Response::Status { downloads: status })
+                    .await
+                    .map_err(|e| AppError::IpcError(e.to_string()))?;
             }
             Command::Pause => {
                 todo!()
@@ -46,8 +51,13 @@ impl CommandHandle {
             Command::Resume => {
                 todo!()
             }
-            Command::Stop => {
-                todo!()
+            Command::Stop { id } => {
+                let state = self.state.lock().await;
+                state.manager.cancel(id)?;
+                let mut stream = self.stream.lock().await;
+                SockConnect::send_response(&mut stream, &Response::Cancelled { id })
+                    .await
+                    .map_err(|e| AppError::IpcError(e.to_string()))?;
             }
         }
         Ok(())
@@ -78,7 +88,8 @@ impl CommandHandle {
         Ok(id)
     }
     async fn status(&self) -> Vec<DownloadStatus> {
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
+        state.manager.cleanup();
         state
             .manager
             .get_all()

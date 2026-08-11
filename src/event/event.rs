@@ -15,4 +15,7 @@ pub enum DownloadEvent {
         id: u64,
         error: String,
     },
+    Cancelled {
+        id: u64,
+    },
 }

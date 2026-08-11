@@ -1,10 +1,10 @@
 use clap::Parser;
-use hoptix::SockConnect;
 use hoptix::config::get_config_path;
 use hoptix::models::message::{Command, Response};
+use hoptix::SockConnect;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::net::UnixStream;
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 
 #[derive(Parser)]
 #[command(name = "hoptix")]
@@ -16,7 +16,9 @@ enum Cli {
         output: Option<String>,
     },
     Status,
-    Stop,
+    Stop {
+        id: u64,
+    },
 }
 
 #[tokio::main]
@@ -68,13 +70,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Response::Error(e) => {
                     eprintln!("Error: {}", e);
                 }
+                Response::Status { downloads } => {
+                    for download in downloads {
+                        println!(
+                            "[{}] {:.2}% | {}/{} bytes | elapsed: {:?}",
+                            download.id,
+                            download.progress,
+                            download.downloaded,
+                            download.total,
+                            download.elapsed
+                        );
+                    }
+                }
+
                 _ => {}
             }
         }
-        Cli::Stop => {
-            let cmd = Command::Stop;
+        Cli::Stop { id } => {
+            let cmd = Command::Stop { id };
             SockConnect::send_command(&mut stream, &cmd).await?;
-            println!("send pause signal");
+
+            let response = SockConnect::read_response(&mut stream).await?;
+            match response {
+                Response::Cancelled { id } => {
+                    println!("download {id} cancelled");
+                }
+                Response::Error(e) => {
+                    eprintln!("daemon Error:{e}");
+                }
+                _ => {
+                    eprintln!("invalid response from daemon");
+                }
+            }
         }
     }
 

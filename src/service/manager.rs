@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -8,7 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::mpsc::{self, Sender},
+    sync::{
+        mpsc::{self, Sender},
+        Mutex,
+    },
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -21,6 +25,14 @@ use crate::{
     service::download_task::DownloadTask,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DownloadState {
+    Running,
+    Finished,
+    Cancelled,
+    Failed,
+}
+
 pub struct DownloadSession {
     pub id: u64,
     pub total: u64,
@@ -28,6 +40,7 @@ pub struct DownloadSession {
     pub start_time: Instant,
     pub handle: Option<JoinHandle<()>>,
     pub cancel_token: CancellationToken,
+    pub state: Arc<Mutex<DownloadState>>,
 }
 
 pub struct DownloadManager {
@@ -59,6 +72,7 @@ impl DownloadManager {
         let cancel_token = CancellationToken::new();
 
         let mut session = DownloadSession::new(id, size, downloaded.clone(), cancel_token.clone());
+        let state = Arc::clone(&session.state);
 
         let task = DownloadTask::new(
             id,
@@ -71,6 +85,7 @@ impl DownloadManager {
             self.event_sender.clone(),
             config,
             cancel_token,
+            state,
         );
 
         let handle = task.start();
@@ -122,12 +137,7 @@ impl DownloadManager {
 
         Ok(())
     }
-    pub fn cleanup(&mut self) {
-        self.downloads.retain(|_, session| match &session.handle {
-            Some(handle) => !handle.is_finished(),
-            None => false,
-        });
-    }
+    pub fn cleanup(&mut self) {}
 }
 
 impl DownloadSession {
@@ -144,6 +154,7 @@ impl DownloadSession {
             start_time: Instant::now(),
             handle: None,
             cancel_token,
+            state: Arc::new(Mutex::new(DownloadState::Running)),
         }
     }
 

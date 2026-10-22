@@ -3,13 +3,19 @@ use crate::{
     error::Result,
     event::event::DownloadEvent,
     routes::netcard::NetworkInterface,
-    service::download::{download_file_parallel, download_single},
+    service::{
+        download::{download_file_parallel, download_single},
+        manager::DownloadState,
+    },
 };
 use std::{
     path::PathBuf,
     sync::{atomic::AtomicU64, Arc},
 };
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, Mutex},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 pub struct DownloadTask {
@@ -23,6 +29,7 @@ pub struct DownloadTask {
     pub progress_tx: mpsc::Sender<DownloadEvent>,
     pub config: Arc<AppConf>,
     pub cancel_token: CancellationToken,
+    pub state: Arc<Mutex<DownloadState>>,
 }
 
 impl DownloadTask {
@@ -37,6 +44,7 @@ impl DownloadTask {
         progress_tx: mpsc::Sender<DownloadEvent>,
         config: Arc<AppConf>,
         cancel_token: CancellationToken,
+        state: Arc<Mutex<DownloadState>>,
     ) -> Self {
         Self {
             id,
@@ -49,6 +57,7 @@ impl DownloadTask {
             progress_tx,
             config,
             cancel_token,
+            state,
         }
     }
     pub fn start(self) -> JoinHandle<()> {

@@ -4,19 +4,15 @@ use crate::{
     models::{
         file_prop::prepare_file,
         message::{Command, Response},
+        request::inspect_url,
     },
     routes::netcard,
-    service::{
-        download::{inspect_url, DownloadStatus},
-        download_task::DownloadTask,
-        manager::DownloadSession,
-    },
+    service::download::DownloadStatus,
     AppState, SockConnect,
 };
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{atomic::Ordering, Arc},
-    time::Instant,
 };
 use tokio::{net::UnixStream, sync::Mutex};
 
@@ -64,9 +60,13 @@ impl CommandHandle {
     }
     async fn start(&self, url: String, output: Option<String>) -> Result<u64> {
         let file_info = inspect_url(&url).await?;
-        let output = output
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("download"));
+        let output = match output {
+            Some(output) => PathBuf::from(output),
+            None => {
+                let filename = file_info.filename.unwrap_or_else(|| "download".to_string());
+                self.config.download_dir.join(filename)
+            }
+        };
 
         let output = prepare_file(&output, file_info.size).await?;
 
@@ -90,19 +90,20 @@ impl CommandHandle {
     async fn status(&self) -> Vec<DownloadStatus> {
         let mut state = self.state.lock().await;
         state.manager.cleanup();
-        state
-            .manager
-            .get_all()
-            .map(|session| {
-                let downloaded = session.downloaded.load(Ordering::SeqCst);
-                DownloadStatus {
-                    id: session.id,
-                    total: session.total,
-                    downloaded,
-                    progress: session.progress(),
-                    elapsed: session.elapsed(),
-                }
-            })
-            .collect()
+        let mut result = Vec::new();
+        for session in state.manager.get_all() {
+            let downloaded = session.downloaded.load(Ordering::SeqCst);
+            let state_val = *session.state.lock().await;
+
+            result.push(DownloadStatus {
+                id: session.id,
+                total: session.total,
+                downloaded,
+                progress: session.progress(),
+                elapsed: session.elapsed(),
+                state: state_val,
+            });
+        }
+        result
     }
 }

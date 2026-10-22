@@ -1,7 +1,8 @@
 use crate::error::{AppError, Result};
 use crate::event::event::DownloadEvent;
-use crate::models::request::{check_range_support, Chunk, FileInfo};
+use crate::models::request::{check_range_support, filename_from_server, Chunk, FileInfo};
 use crate::routes::netcard::NetworkInterface;
+use crate::service::manager::DownloadState;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -24,28 +25,7 @@ pub struct DownloadStatus {
     pub downloaded: u64,
     pub progress: f64,
     pub elapsed: Duration,
-}
-
-pub async fn inspect_url(url: &str) -> Result<FileInfo> {
-    let client = Client::new();
-    let response = client.head(url).send().await?;
-
-    let support_range = check_range_support(url).await.is_ok();
-
-    let size = response
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    if size == 0 {
-        return Err(AppError::InvalidFileSize);
-    }
-    Ok(FileInfo {
-        url: url.to_string(),
-        size,
-        support_range,
-    })
+    pub state: DownloadState,
 }
 
 pub fn create_chunk(file_size: u64, num_chunk: usize) -> Vec<Chunk> {
@@ -145,27 +125,27 @@ pub async fn download_file_parallel(
         loop {
             tokio::select! {
                 _ = cancel.cancelled()=>{break;}
-                _ = tokio::time::sleep(Duration::from_millis(500)) =>{
-            let current = downloaded_clone.load(Ordering::SeqCst);
-            let now = std::time::Instant::now();
-            let elapsed = now.duration_since(last_time).as_secs_f64();
-            let speed = if elapsed > 0.0 {
-                (current - last_downloaded) as f64 / elapsed
-            } else {
-                0.0
-            };
-            let _ = progress_tx_clone
-                .send(DownloadEvent::Progress {
-                    id,
-                    downloaded: current,
-                    total,
-                })
-                .await;
-            last_downloaded = current;
-            last_time = now;
-            if current >= total {
-                break;
-            }
+                _ = tokio::time::sleep(Duration::from_secs(1)) =>{
+                    let current = downloaded_clone.load(Ordering::SeqCst);
+                    let now = std::time::Instant::now();
+                    let elapsed = now.duration_since(last_time).as_secs_f64();
+                    let speed = if elapsed > 0.0 {
+                        (current - last_downloaded) as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+                    let _ = progress_tx_clone
+                        .send(DownloadEvent::Progress {
+                            id,
+                            downloaded: current,
+                            total,
+                        })
+                        .await;
+                    last_downloaded = current;
+                    last_time = now;
+                    if current >= total {
+                        break;
+                    }
             }}
         }
     });
@@ -257,16 +237,30 @@ pub async fn download_file_parallel(
                     )
                     .await
                     {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+
                         faile_count += 1;
+
                         eprintln!(
                             "Error on [{}] to download {}: (error message:{:?})",
                             iface.name, chunk.id, e
                         );
+
                         let mut lock = queue.lock().await;
                         lock.push_back(chunk);
                         drop(lock);
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_secs(1))=> {}
+                        }
                     } else {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+
                         faile_count = 0;
                         println!("chonck:{} downloading with [{}]", chunk.id, iface.name);
                     }
@@ -279,8 +273,9 @@ pub async fn download_file_parallel(
     while let Some(res) = joinset.join_next().await {
         res.map_err(|e| AppError::IpcError(e.to_string()))?;
     }
-
-    downloaded.store(file_size, Ordering::SeqCst);
+    if !cancel_token.is_cancelled() {
+        downloaded.store(file_size, Ordering::SeqCst);
+    }
 
     Ok(())
 }
@@ -319,13 +314,18 @@ pub async fn download_chunk_with_client(
                     Some(i)=>i?,
                     None=>break,
                 };
-                let data = item;
 
-                file.write_at(&data, offset).map_err(AppError::Io)?;
+                if cancel_token.is_cancelled(){return Ok(());}
 
-                offset += data.len() as u64;
+                file.write_at(&item, offset).map_err(AppError::Io)?;
 
-                downloaded.fetch_add(data.len() as u64, Ordering::SeqCst);
+                if cancel_token.is_cancelled(){return Ok(());}
+
+                offset += item.len() as u64;
+
+                if !cancel_token.is_cancelled(){
+                    downloaded.fetch_add(item.len() as u64, Ordering::SeqCst);
+                }
 
 
             }

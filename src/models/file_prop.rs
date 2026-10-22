@@ -1,6 +1,7 @@
 use crate::error::{AppError, Result};
 use std::path::{Path, PathBuf};
 use tokio::fs::{self, File};
+use url::Url;
 
 pub async fn resolve_path(target_path: impl AsRef<Path>) -> PathBuf {
     let path = target_path.as_ref();
